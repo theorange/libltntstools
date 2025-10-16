@@ -6,6 +6,7 @@ AC_INIT([libltntstools], [1.0], [stoth@ltnglobal.com])
 AM_INIT_AUTOMAKE
 AC_CONFIG_MACRO_DIR([m4])
 AC_CANONICAL_HOST
+AC_GNU_SOURCE
 AM_SILENT_RULES([yes])
 AC_CONFIG_FILES([src/libltntstools.pc:src/libltntstools.pc.in])
 
