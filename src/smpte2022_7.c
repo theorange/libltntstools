@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <math.h>
 #include <arpa/inet.h>
+#include <limits.h>
 
 #include "libltntstools/smpte2022_7.h"
 
@@ -16,7 +17,7 @@
 #define RTP_HEADER_SIZE     12
 #define RTP_MAX_PACKET_SIZE (RTP_HEADER_SIZE + RTP_PAYLOAD_SIZE)
 #define MAX_LEGS            3
-
+#define MAX_PACKET_BACKLOG  10 * 1024 * 1024
 
 
 struct pkt_entry {
@@ -27,24 +28,44 @@ struct pkt_entry {
     struct timespec tm;
 };
 
+typedef struct {
+    bool seen;
+    bool ready;
+    uint16_t seq;
+    uint32_t timestamp;
+    struct timespec tm;
+    uint64_t byte_count;
+} leg_stats_t;
+
 struct smpte_2022_7_rx_s {
+    // callback stuff
     smpte_2022_7_rx_cb cb;
-    void *user_data;
-    struct pkt_entry buf[1024];  // simple fixed buffer
+    void *user_data;    
+
+    // buffer stuff
+    struct pkt_entry *buf, *tip;
     int buf_count;
+    int buf_capacity;
+    
+    // tracking
     uint16_t expected_seq;
     uint32_t last_ts;
+
+    // classification
+    uint8_t legs;
+    char receiver_class;
+
+    // initialization
+    leg_stats_t leg_stats[MAX_LEGS];
+    struct timespec first_packet_time;
     bool initialized;
+    bool all_seen;
+
+    // logging
     int verbose;
     struct ltntstools_logger_s logger;
 };
 
-typedef struct {
-    
-    uint16_t seq;
-    uint32_t timestamp;
-    uint32_t ssrc;
-} leg_state_t;
 
 struct smpte_2022_7_tx_s {
     smpte_2022_7_tx_cb cb;
@@ -122,6 +143,18 @@ static inline bool ts_validate(const uint8_t *p_ts)
 
 // </bitstream_functions> --------------------------------------------------------
 
+#define UINT32_HALF (UINT32_MAX >> 1)
+
+
+static int seq_le(uint16_t a, uint16_t b)
+{
+    return (int16_t)(a - b) <= 0;
+}
+
+static int seq_gt(uint16_t a, uint16_t b)
+{
+    return !seq_le(a, b);
+}
 
 /* Sequence number comparison with wrap-around */
 static int seq_lt(uint16_t a, uint16_t b)
@@ -131,9 +164,14 @@ static int seq_lt(uint16_t a, uint16_t b)
 
 static int ts_le(uint32_t a, uint32_t b)
 {
-    return (int32_t)(a - b) <= 0;
+    return (int32_t)(a - b) <= 0; //  && (b - a) < UINT32_HALF;
 }
 
+
+static int ts_gt(uint32_t a, uint32_t b)
+{
+    return !ts_le(a, b);
+}
 
 static void rtp_build_header(unsigned char *hdr, uint16_t seq, uint32_t ts, uint32_t ssrc)
 {
@@ -154,15 +192,38 @@ static void rtp_build_header(unsigned char *hdr, uint16_t seq, uint32_t ts, uint
 
 // SMPTE 2022-7 Receiver API --------------------------------------------------------
 
-smpte_2022_7_rx_t *smpte_2022_7_rx_new(smpte_2022_7_rx_cb cb, void *user_data)
-{
+smpte_2022_7_rx_t *smpte_2022_7_rx_new(smpte_2022_7_rx_cb cb, void *user_data, uint8_t legs, char receiver_class)
+{    
+    if (legs > MAX_LEGS) {
+        // LTN_ERROR(&ctx->logger, "%s(): legs=%hhu exceeds max=%d", __func__, legs, MAX_LEGS);
+        errno = EINVAL;
+        return NULL;
+    }
+
+    receiver_class = toupper(receiver_class);
+    if (receiver_class < 'A' || receiver_class > 'D') {
+        // LTN_ERROR(&ctx->logger, "%s(): receiver_class=%c, valid values A,B,C,D, __func__, receiver_class);
+        errno = EINVAL;
+        return NULL;
+    }
+
     smpte_2022_7_rx_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
         return NULL;
+
+    ctx->buf_capacity = 1024;
+    ctx->buf = calloc(ctx->buf_capacity, sizeof(struct pkt_entry));
+    if (!ctx->buf) {
+        free(ctx);
+        return NULL;
+    }
+    
     ctx->cb = cb;
     ctx->user_data = user_data;
+    ctx->receiver_class = receiver_class;
     ctx->expected_seq = 0;
     ctx->last_ts = 0;
+    ctx->legs = legs;
     return ctx;
 }
 
@@ -171,6 +232,7 @@ int smpte_2022_7_rx_free(smpte_2022_7_rx_t *ctx)
     if (!ctx) return -1;
     for (int i = 0; i < ctx->buf_count; i++)
         free(ctx->buf[i].data);
+    free(ctx->buf);
     free(ctx);
     return 0;
 }
@@ -182,77 +244,203 @@ static int smpte_2022_7_rx_buffer_erase(smpte_2022_7_rx_t *ctx, int index) {
     return 0;
 }
 
+static int smpte_2022_7_rx_check_init(smpte_2022_7_rx_t *ctx, int which) {
+    if (ctx->initialized) return 0;
+
+    leg_stats_t *stats = &ctx->leg_stats[which];
+
+    if (!ctx->first_packet_time.tv_sec && !ctx->first_packet_time.tv_nsec) {
+        // this is the first packet we're seeing, record the timestamp.
+        memcpy(&ctx->first_packet_time, &stats->tm, sizeof(ctx->first_packet_time));
+    }
+    
+    if (!ctx->all_seen) {
+        if (!stats->seen) {
+            LTN_INFO(&ctx->logger, "Found leg %d at seq=%d", which, stats->seq);
+        }
+        
+        stats->seen = true;
+
+        bool all_seen = true;
+        leg_stats_t *most_advanced = &ctx->leg_stats[0];
+
+        // find the highest sequence number (considering wraparound). this will be our starting position to measure PD.
+        for (int i = 0; i < ctx->legs; ++i) {
+            leg_stats_t *leg = &ctx->leg_stats[i];
+            all_seen = all_seen && leg->seen;
+            if (i && seq_lt(most_advanced->seq, leg->seq))
+                most_advanced = leg;
+        }
+
+        if (all_seen) {            
+            ctx->all_seen = true;
+            // reset the first-packet time based on this most-advanced packet, we'll count from here.
+            memcpy(&ctx->first_packet_time, &stats->tm, sizeof(ctx->first_packet_time));
+            
+            most_advanced->ready = true;
+
+            // record what we're looking out for
+            ctx->expected_seq = most_advanced->seq;
+            ctx->last_ts = stats->timestamp - 1;
+            while (ctx->buf_count > 0) {
+                if (ctx->buf[0].seq == ctx->expected_seq && ctx->buf[0].ts == most_advanced->timestamp) {
+                    break;
+                }
+                smpte_2022_7_rx_buffer_erase(ctx, 0);
+            }
+            LTN_INFO(&ctx->logger, "All %d legs seen, watching for seq=%hu on all legs", ctx->legs, ctx->expected_seq);
+        }
+    }
+    else {
+        // 2 cases to handle:
+
+        // 1. Sequence waiting (preferred)
+        bool all_ready = true;
+        struct timespec *latest = NULL;
+        for (int i = 0; i < ctx->legs; ++i) {
+            leg_stats_t *leg = &ctx->leg_stats[i];
+            if (!leg->ready && seq_le(ctx->expected_seq, leg->seq)) {
+                leg->ready = true;
+                latest = &leg->tm;
+            }
+            all_ready = all_ready && leg->ready;
+        }
+
+        uint64_t diff;
+        if (all_ready && latest) {
+            diff = (latest->tv_sec - ctx->first_packet_time.tv_sec) * 1000000 + (latest->tv_nsec - ctx->first_packet_time.tv_nsec) / 1000;
+            // LTN_INFO(&ctx->logger, "instantaneous path differential, PD=%.3fms", diff / 1000.);
+            // ctx->initialized = true; // TODO: keep acruing to max of class.
+            // return 0;
+        }
+
+        // 2. Time-based worst-case, based on receiver class (fallback or fatal)
+
+        uint64_t diff_us = (stats->tm.tv_sec - ctx->first_packet_time.tv_sec) * 1000000 + (stats->tm.tv_nsec - ctx->first_packet_time.tv_nsec) / 1000;        
+        uint64_t target = 0;
+        switch (ctx->receiver_class) {
+        case 'A':
+            target = 10000;
+            break; 
+        case 'B':
+            target = 50000;
+            break;
+        case 'C':
+            target = 450000;
+            break;
+        case 'D':
+            target = 150;
+            break;
+        }
+        double diff_percent = (1.0 * diff_us)/target;
+        if (diff_percent < 1 && diff_percent > .95) {
+            if (!all_ready) {
+                LTN_INFO(&ctx->logger, "PD=%.3fms requirement for a class '%c' receiver! All bets are off!", target / 1000., ctx->receiver_class);
+            }
+            else {
+                LTN_INFO(&ctx->logger, "Initialization complete! Receiver class '%c', MD=%.3fms", ctx->receiver_class, diff_us / 1000.);
+            }
+            ctx->initialized = true;
+        }
+        else if (all_ready && latest) {
+            LTN_INFO(&ctx->logger, "PD=%.3fms requirement=%.3fms for a class '%c' receiver.", diff_us / 1000., target / 1000., ctx->receiver_class);
+        }
+    }
+}
+
 
 int smpte_2022_7_rx_push_packet(smpte_2022_7_rx_t *ctx, int which, unsigned char *data, int len)
-{
-    (void)which; // we don’t actually care which leg this came from
+{   
     if (!ctx || !data || len < 4)
         return -1;
 
-    uint16_t seq = rtp_get_seqnum(data);
-    uint32_t ts = rtp_get_timestamp(data);
+    leg_stats_t *stats = &ctx->leg_stats[which];
 
-    if (ctx->initialized && seq_lt(seq, ctx->expected_seq)) {
-        if (ts_le(ts, ctx->last_ts)) {
-            LTN_DEBUG(&ctx->logger, "rx discarding seq=%d ts=%u last_ts=%u delta=%d", (int)seq, ts, ctx->last_ts, (int32_t)(ts - ctx->last_ts));
-            /* 
-             * This is too old of a sequence number / timestamp, drop it.
-             * We need to consider both seq and ts to account for rollover times for high bitrate streams.
-             */
-            return 0;
-        }
-        else {
-            LTN_DEBUG(&ctx->logger, "rx  retaining seq=%d ts=%u last_ts=%u delta=%d", (int)seq, ts, ctx->last_ts, (int32_t)(ts - ctx->last_ts));
-        }
-             
+    stats->seq = rtp_get_seqnum(data);
+    stats->timestamp = rtp_get_timestamp(data);
+    stats->byte_count += len;
+    clock_gettime(CLOCK_MONOTONIC, &stats->tm);
+
+    if (!ctx->initialized && smpte_2022_7_rx_check_init(ctx, which) < 0) {
+        return -1;
     }
 
-    int min = -1;
-    struct timespec tm, mintm;
-    clock_gettime(CLOCK_MONOTONIC, &tm);
-    memcpy(&mintm, &tm, sizeof(tm));
+    struct pkt_entry *tip = NULL;
+    if (ctx->buf_count > 0) {
+        tip = &ctx->buf[ctx->buf_count - 1];
+    }
+    
+    // This is too old of a sequence number / timestamp, drop it.
+    // We need to consider both seq and ts to account for rollover times for high bitrate streams.
+    bool discard = true;
 
-    // check if we already have this seq
-    for (int i = 0; i < ctx->buf_count; i++) {
-        struct pkt_entry *pkt = &ctx->buf[i];
-        if (pkt->seq == seq)
-            return 0; // duplicate packet, ignore
-        if (ctx->buf_count >= 1024 && (mintm.tv_sec > pkt->tm.tv_sec || mintm.tv_nsec > pkt->tm.tv_nsec)) {
-            mintm.tv_sec = pkt->tm.tv_sec;
-            mintm.tv_nsec = pkt->tm.tv_nsec;
-            min = i;
+    if (!tip || (seq_gt(stats->seq, tip->seq) && ts_gt(stats->timestamp, tip->ts))) {
+        // this is the most likely scenario, and cheapest to evaluate
+        discard = false;
+    }
+    else {
+        for (int i = ctx->buf_count - 1; i >= 0; --i) {
+            struct pkt_entry *pkt = &ctx->buf[i];
+            if (stats->seq == pkt->seq && stats->timestamp == pkt->ts) {
+                discard = true;
+                break;
+            }
+            // TODO: else {...} for optimization?
         }
     }
 
-    if (ctx->buf_count >= 1024) {
-        if (min >= 0) {                    
-            smpte_2022_7_rx_buffer_erase(ctx, min);
-        }
-        else return -1; // buffer full
+    if (discard) {
+        LTN_DEBUG(&ctx->logger, "rx discarding leg=%d seq=%d pseq=%d ts=%u last_ts=%u delta=%d",
+            which, (int)stats->seq, (int)(tip ? tip->seq: -1), stats->timestamp, tip ? tip->ts: 0, (int32_t)(stats->timestamp - ctx->last_ts));
+        return 0;
     }
 
     // store packet
+
+    if (ctx->buf_count >= ctx->buf_capacity) {
+        // TODO: review this, maybe switch to circular buffer for performance
+        if (!ctx->initialized) {
+            if (ctx->buf_capacity > MAX_PACKET_BACKLOG) {
+                LTN_ERROR(&ctx->logger, "Max buffer capacity exceeded");
+                errno = ENOBUFS;
+                return -1;
+            }
+
+            ctx->buf_capacity *= 2;
+            ctx->buf = realloc(ctx->buf, ctx->buf_capacity);
+        }
+        else {
+            LTN_ERROR(&ctx->logger, "Max buffer capacity exceeded");
+            errno = ENOBUFS;
+            return -1;
+        }
+    }
+
     struct pkt_entry *pkt = &ctx->buf[ctx->buf_count];
-    pkt->seq = seq;
-    pkt->ts = ts;
+    pkt->seq = stats->seq;
+    pkt->ts = stats->timestamp;
     pkt->len = len;
     pkt->data = malloc(len);
     memcpy(pkt->data, data, len);
-    memcpy(&pkt->tm, &tm, sizeof(tm));    
+    memcpy(&pkt->tm, &stats->tm, sizeof(stats->tm));
     ctx->buf_count++;
-    
-    if (!ctx->initialized) {
-        ctx->expected_seq = ctx->buf[0].seq;
-        ctx->last_ts = ctx->buf[0].ts - 1;
-        ctx->initialized = true;
-    }
+
+    uint8_t ssrc[16];
+    rtp_get_ssrc(pkt->data, ssrc);
+
+    LTN_DEBUG(&ctx->logger, "admit seq=%06d ts=%u ssrc=%02hx%02hx%02hx%02hx, tip_seq=%06d, ts=%u",
+        (int)stats->seq, stats->timestamp, ssrc[0], ssrc[1], ssrc[2], ssrc[3],
+        (int) (tip ? tip->seq : -1), (unsigned int)(tip ? tip->ts : 0));
+
+    // we're still acruing, don't let anything out the door.
+    if (!ctx->initialized) return 0;
 
     // try to flush in order
     int flushed = 0;
     while (1) {
         int found = -1;
         for (int i = 0; i < ctx->buf_count; i++) {
-            if (ctx->buf[i].seq == ctx->expected_seq) {
+            if (ctx->buf[i].seq == ctx->expected_seq && ts_le(ctx->last_ts, ctx->buf[i].ts)) {
                 found = i;
                 break;
             }
@@ -265,13 +453,24 @@ int smpte_2022_7_rx_push_packet(smpte_2022_7_rx_t *ctx, int which, unsigned char
         
         ctx->cb(ctx->user_data, ctx->buf[found].data, ctx->buf[found].len);
         flushed++;
-        LTN_DEBUG(&ctx->logger, "rx seq=%06d, tx seq=%06d, flushed=%d, index=%d/%d", (int)seq, (int)ctx->expected_seq, flushed, found, ctx->buf_count);
-        
+        rtp_get_ssrc(ctx->buf[found].data, ssrc);
+        LTN_DEBUG(&ctx->logger, "rx seq=%06d ts=%u, tx seq=%06d ts=%u, ssrc=%02hx%02hx%02hx%02hx index=%d/%d",
+            (int)stats->seq, stats->timestamp,
+            (int)ctx->expected_seq, ctx->buf[found].ts,
+            ssrc[0], ssrc[1], ssrc[2], ssrc[3],
+            found, ctx->buf_count);
+
         ctx->last_ts = ctx->buf[found].ts;
 
         smpte_2022_7_rx_buffer_erase(ctx, found);
         
         ctx->expected_seq++;
+        break;
+    }
+
+    if (!flushed) {
+        LTN_DEBUG(&ctx->logger, "no bytes written on arrival of leg=%d seq=%06d ts=%u",
+            which, (int)rtp_get_seqnum(data), rtp_get_timestamp(data));
     }
 
     return flushed;
@@ -288,10 +487,8 @@ int smpte_2022_7_rx_push_packets(smpte_2022_7_rx_t *ctx, int which, unsigned cha
             unsigned char *next = rtp_payload(p);
             while (next < end && ts_validate(next)) next += TS_PACKET_SIZE;
 
-            int rc = smpte_2022_7_rx_push_packet(ctx, 0, p, next - p);            
-            uint8_t ssrc[16];
-            rtp_get_ssrc(p, ssrc);
-            LTN_DEBUG(&ctx->logger, "push written=%02d seq=%06d ssrc=%02hx%02hx%02hx%02hx ts=%d", rc, (int)rtp_get_seqnum(p), ssrc[0], ssrc[1], ssrc[2], ssrc[3], rtp_get_timestamp(p));
+            int rc = smpte_2022_7_rx_push_packet(ctx, which, p, next - p);
+            if (rc < 0) return rc;
             p = next;
             ++i;
         }

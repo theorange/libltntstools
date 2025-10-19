@@ -6,7 +6,7 @@
 typedef struct smpte_2022_7_rx_s smpte_2022_7_rx_t;
 typedef int (*smpte_2022_7_rx_cb)(void *user_data, unsigned char *data, int len);
 
-smpte_2022_7_rx_t * smpte_2022_7_rx_new(smpte_2022_7_rx_cb cb, void *user_data);
+smpte_2022_7_rx_t * smpte_2022_7_rx_new(smpte_2022_7_rx_cb cb, void *user_data, uint8_t legs, char receiver_class);
 int smpte_2022_7_rx_free(smpte_2022_7_rx_t *handle);
 
 /**
